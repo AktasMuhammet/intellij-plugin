@@ -715,18 +715,30 @@ private class OverallChangesPanel(private val project: Project) : JPanel(BorderL
 
     private fun loadOverallData(): OverallData {
         val empty = OverallData(emptyList(), 0, 0, 0, 0, emptyMap(), 0, emptySet(), 0)
-        val cwd = GitUtils.getRepoRoot(project) ?: project.basePath ?: return empty
+        // Every repo the project spans — itself, or each clone nested beneath it
+        // when the project dir was opened above them (see discoverRepoRoots).
+        val repos = project.getService(ai.blamely.cli.CliDataService::class.java)?.projectRepoRoots()
+            ?.takeIf { it.isNotEmpty() }
+            ?: GitUtils.discoverRepoRoots(listOfNotNull(project.basePath))
+        if (repos.isEmpty()) return empty
 
-        val logOut = GitUtils.run(cwd, "log", "--format=%H%n%aN%n%ar", "--max-count=50")
-            ?: return empty
-        val logLines = logOut.lines().filter { it.isNotBlank() }
-        data class GitCommitInfo(val sha: String, val author: String, val date: String)
+        data class GitCommitInfo(val repo: String, val sha: String, val author: String, val date: String, val ts: Long)
         val gitInfos = mutableListOf<GitCommitInfo>()
-        var i = 0
-        while (i + 2 < logLines.size) {
-            gitInfos.add(GitCommitInfo(logLines[i], logLines[i + 1], logLines[i + 2]))
-            i += 3
+        for (repo in repos) {
+            // %ct alongside %ar so commits from sibling repos interleave in real
+            // chronological order rather than repo by repo.
+            val logOut = GitUtils.run(repo, "log", "--format=%H%n%aN%n%ar%n%ct", "--max-count=50") ?: continue
+            val logLines = logOut.lines().filter { it.isNotBlank() }
+            var i = 0
+            while (i + 3 < logLines.size) {
+                gitInfos.add(
+                    GitCommitInfo(repo, logLines[i], logLines[i + 1], logLines[i + 2], logLines[i + 3].toLongOrNull() ?: 0L)
+                )
+                i += 4
+            }
         }
+        gitInfos.sortByDescending { it.ts }
+        if (gitInfos.size > 50) gitInfos.subList(50, gitInfos.size).clear() // same window as before, now across all repos
 
         val commits = mutableListOf<CommitReport>()
         val globalModelDetails = mutableMapOf<String, ModelDetail>()
@@ -734,7 +746,7 @@ private class OverallChangesPanel(private val project: Project) : JPanel(BorderL
         var totalAi = 0; var totalHuman = 0; var totalDel = 0; var totalFiles = 0; var totalWait = 0L; var totalCoding = 0L
 
         for (info in gitInfos) {
-            val note = GitUtils.getNoteContent(cwd, info.sha) ?: continue
+            val note = GitUtils.getNoteContent(info.repo, info.sha) ?: continue
             val report = parseReport(note, info.author, info.date) ?: continue
             commits.add(report)
             totalAi += report.aiLinesAdded

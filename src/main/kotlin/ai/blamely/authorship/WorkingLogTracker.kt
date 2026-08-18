@@ -23,6 +23,7 @@ class WorkingLogTracker(private val project: Project) : Disposable {
         Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "blamely-worklog").apply { isDaemon = true } }
     private val trackers = ConcurrentHashMap<String, FileTracker>()
     private val flushTasks = ConcurrentHashMap<String, ScheduledFuture<*>>()
+    private val inFlightDeletions = java.util.concurrent.atomic.AtomicInteger(0)
 
     /** Called by CompletionDetector for each classified change (AI + human), off
      *  the EDT via the executor. prevText is the file content BEFORE this change —
@@ -152,11 +153,16 @@ class WorkingLogTracker(private val project: Project) : Disposable {
 
     /** Record AI-deleted baseline lines via `blamely record-deletion` (current content
      *  piped on stdin, since the buffer may be unsaved). Fire-and-forget; output
-     *  discarded so it never blocks the worklog thread. */
+     *  discarded so it never blocks the worklog thread.
+     *
+     *  Bounded on both axes, because nothing waits on the child: without a deadline
+     *  one that blocks (SQLite lock, unreachable daemon) lives until the IDE exits,
+     *  and without a cap a burst of AI deletes spawns unboundedly many at once. */
     private fun recordDeletion(absPath: String, content: String, author: Author) {
         try {
             val bin = blamelyBinaryPath()
             if (!java.io.File(bin).exists()) return
+            if (inFlightDeletions.get() >= MAX_INFLIGHT_DELETIONS) return
             val args = mutableListOf(bin, "record-deletion", absPath, "--gen-type", author.genType.ifEmpty { "completion" })
             if (author.tool.isNotEmpty()) { args.add("--tool"); args.add(author.tool) }
             if (author.model.isNotEmpty()) { args.add("--model"); args.add(author.model) }
@@ -164,7 +170,20 @@ class WorkingLogTracker(private val project: Project) : Disposable {
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                 .redirectError(ProcessBuilder.Redirect.DISCARD)
             val p = pb.start()
-            p.outputStream.use { it.write(content.toByteArray()); it.flush() }
+            inFlightDeletions.incrementAndGet()
+            // Runs on normal exit AND on the timeout, so the counter always comes back
+            // down. destroyForcibly, not destroy: a child ignoring SIGTERM or already
+            // stopped would otherwise stay in the process table.
+            p.onExit().orTimeout(RECORD_DELETION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .whenComplete { _, _ ->
+                    if (p.isAlive) p.destroyForcibly()
+                    inFlightDeletions.decrementAndGet()
+                }
+            try {
+                p.outputStream.use { it.write(content.toByteArray()); it.flush() }
+            } catch (_: Exception) {
+                // child already gone — onExit still releases the slot
+            }
         } catch (_: Exception) {
         }
     }
@@ -184,20 +203,32 @@ class WorkingLogTracker(private val project: Project) : Disposable {
 
     private data class Ctx(val repoRoot: String, val branch: String, val baseSha: String, val rel: String)
 
+    /**
+     * The working log's key (repo, branch, base commit, relative path).
+     *
+     * Called on every seed AND every debounced flush — i.e. roughly every 400ms per
+     * file while the user types. It used to spawn `rev-parse --abbrev-ref HEAD` and
+     * `rev-parse HEAD` each time, through a ProcessBuilder with NO timeout, so a git
+     * that hung pinned the single worklog thread permanently. Both values are read
+     * straight out of the git dir now; git is spawned only if HEAD is unreadable.
+     *
+     * This also fixes the detached-HEAD branch name. `--abbrev-ref HEAD` returns the
+     * literal "HEAD" when detached rather than failing, so the plugin wrote logs under
+     * `working_logs/HEAD/` while the CLI (which uses symbolic-ref, see
+     * internal/authorship/capture.go) and the VS Code plugin both use "DETACHED" —
+     * the CLI could not find what the IDE had written.
+     */
     private fun resolveCtx(absPath: String): Ctx? {
         val repoRoot = GitUtils.getRepoRoot(absPath) ?: return null
         val rel = GitUtils.toRepoRelativePath(repoRoot, absPath) ?: return null
-        val branch = git(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")?.takeIf { it.isNotEmpty() } ?: "DETACHED"
-        val head = git(repoRoot, "rev-parse", "HEAD")?.takeIf { it.isNotEmpty() } ?: "INITIAL"
+        val gitDir = GitUtils.gitDir(repoRoot)
+        val state = gitDir?.let { GitUtils.readHeadState(it) }
+        if (state != null) {
+            return Ctx(repoRoot, state.branch ?: "DETACHED", state.sha ?: "INITIAL", rel)
+        }
+        val branch = GitUtils.getBranchName(repoRoot) ?: "DETACHED"
+        val head = GitUtils.run(repoRoot, "rev-parse", "HEAD")?.trim()?.takeIf { it.isNotEmpty() } ?: "INITIAL"
         return Ctx(repoRoot, branch, head, rel)
-    }
-
-    private fun git(cwd: String, vararg args: String): String? = try {
-        val p = ProcessBuilder(listOf("git", "-C", cwd) + args).start()
-        val out = p.inputStream.bufferedReader().readText().trim()
-        if (p.waitFor() == 0) out else null
-    } catch (_: Exception) {
-        null
     }
 
     override fun dispose() {
@@ -208,5 +239,10 @@ class WorkingLogTracker(private val project: Project) : Disposable {
         // Short, so a Tab-accept immediately followed by a commit is persisted before
         // the commit reads the working log.
         private const val FLUSH_DEBOUNCE_MS = 400L
+
+        // Ceilings for the fire-and-forget `blamely record-deletion` children (see
+        // recordDeletion) — nothing waits on them, so they need their own bounds.
+        private const val RECORD_DELETION_TIMEOUT_MS = 10_000L
+        private const val MAX_INFLIGHT_DELETIONS = 4
     }
 }

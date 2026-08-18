@@ -145,6 +145,169 @@ object GitUtils {
 
     fun clearRepoRootCache() {
         repoRootCache.clear()
+        gitDirCache.clear()
+        discoveredReposCache.clear()
+    }
+
+    // ── Nested repo discovery ───────────────────────────────────────────────
+
+    /** How deep below a project dir we look for repos. 1 covers
+     *  `project/{backend,frontend}`; 3 also covers `project/services/api`. */
+    private const val MAX_CHILD_REPO_DEPTH = 3
+    /** A dir holding more clones than this is a checkout root, not a project. */
+    private const val MAX_CHILD_REPOS = 25
+    /** Dependency/build trees: no attributable source, huge directory counts, and
+     *  sometimes vendored .git dirs that would be reported as the user's repos. */
+    private val SKIP_SCAN_DIRS = setOf(
+        "node_modules", "vendor", "target", "build", "dist", "out", "bin", "obj",
+        "coverage", "venv", "Pods", "DerivedData", "__pycache__", "tmp", "temp",
+    )
+
+    private val discoveredReposCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+
+    /**
+     * The git repositories [dir] covers.
+     *
+     * Normally exactly one: the repo containing [dir]. But a project opened ABOVE
+     * its repos — a directory holding separate `backend/` and `frontend/` clones —
+     * is in no repo at all, and `git rev-parse` cannot help because it only searches
+     * upward. Everything keyed off the project dir (gutter, tool window, HEAD watch)
+     * then found nothing, even though Blamely had captured the edits correctly. So
+     * when the dir isn't in a repo we scan a bounded distance DOWNWARD instead.
+     *
+     * Mirrors gitutil.DiscoverRepos in the CLI and discoverRepoRoots in the VS Code
+     * plugin; keep the three in step.
+     */
+    fun discoverRepoRoots(dir: String): List<String> {
+        if (dir.isBlank()) return emptyList()
+        discoveredReposCache[dir]?.let { return it }
+        val base = File(dir)
+        // getRepoRoot falls back to the path itself when git finds no repo, so an
+        // actual .git is what tells the two cases apart.
+        val own = getRepoRoot(dir)
+        val roots = if (own != null && File(own, ".git").exists()) {
+            listOf(own)
+        } else {
+            val found = ArrayList<String>()
+            scanForRepos(base, 0, found)
+            found.sorted()
+        }
+        if (roots.isNotEmpty()) discoveredReposCache[dir] = roots
+        return roots
+    }
+
+    private fun scanForRepos(dir: File, depth: Int, found: MutableList<String>) {
+        if (depth > MAX_CHILD_REPO_DEPTH || found.size >= MAX_CHILD_REPOS) return
+        val entries = dir.listFiles() ?: return
+        // A .git entry makes this a repo root: take it and stop descending — a repo
+        // nested inside a work tree is a submodule, already covered by its parent.
+        if (entries.any { it.name == ".git" }) {
+            // Canonical, matching what `git rev-parse --show-toplevel` returns, so the
+            // same repo reached by two spellings (macOS /var → /private/var, or a
+            // content root inside it) dedupes instead of being scanned twice.
+            found.add(try { dir.canonicalPath } catch (_: Exception) { dir.path })
+            return
+        }
+        for (e in entries) {
+            if (!e.isDirectory) continue
+            if (e.name.startsWith(".") || e.name in SKIP_SCAN_DIRS) continue
+            // Never follow a symlink: it can escape the project or loop, and a
+            // symlinked repo is still reachable by its real path.
+            if (java.nio.file.Files.isSymbolicLink(e.toPath())) continue
+            scanForRepos(e, depth + 1, found)
+        }
+    }
+
+    /** Every distinct repo for a project: the repo containing its base dir and
+     *  content roots, or each clone nested beneath them. */
+    fun discoverRepoRoots(paths: Collection<String>): List<String> {
+        val roots = LinkedHashSet<String>()
+        for (p in paths) roots.addAll(discoverRepoRoots(p))
+        return roots.toList()
+    }
+
+    private val gitDirCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * Absolute git dir for [repoRoot] (worktree/submodule-safe), cached. Resolving
+     * this is the only part of reading HEAD that still needs a git process, so it
+     * happens once per repo rather than on every check.
+     */
+    fun gitDir(repoRoot: String): String? {
+        gitDirCache[repoRoot]?.let { return it }
+        val dir = run(repoRoot, "rev-parse", "--path-format=absolute", "--git-dir")
+            ?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        gitDirCache[repoRoot] = dir
+        return dir
+    }
+
+    /** Current HEAD as read from the git dir. [sha] is null on an unborn branch
+     *  (fresh `git init`), [branch] is null when HEAD is detached. */
+    data class HeadState(val sha: String?, val branch: String?)
+
+    private val OBJECT_ID = Regex("^[0-9a-f]{40}([0-9a-f]{24})?$")
+
+    /** Directory holding this repo's refs. A LINKED WORKTREE has its own HEAD but
+     *  shares `refs/` and `packed-refs` with the main repo, via `commondir`. */
+    private fun commonDir(gitDir: String): String =
+        try {
+            val raw = File(gitDir, "commondir").readText().trim()
+            if (raw.isEmpty()) gitDir else File(gitDir, raw).canonicalPath
+        } catch (_: Exception) {
+            gitDir
+        }
+
+    /** Resolve a full ref name (`refs/heads/main`) to its object id, or null. */
+    private fun resolveRef(gitDir: String, ref: String): String? {
+        val common = commonDir(gitDir)
+        // Loose ref first: a commit always writes one. packed-refs only holds refs
+        // that `git gc` / `git pack-refs` has since folded away.
+        val bases = if (common == gitDir) listOf(gitDir) else listOf(gitDir, common)
+        for (base in bases) {
+            try {
+                val raw = File(base, ref).readText().trim()
+                if (OBJECT_ID.matches(raw)) return raw
+            } catch (_: Exception) {
+                // not a loose ref under this base
+            }
+        }
+        return try {
+            File(common, "packed-refs").useLines { lines ->
+                lines.firstNotNullOfOrNull { line ->
+                    // '# pack-refs with: ...' header, and '^<sha>' peel lines for tags.
+                    if (line.isEmpty() || line[0] == '#' || line[0] == '^') return@firstNotNullOfOrNull null
+                    val sp = line.indexOf(' ')
+                    if (sp > 0 && line.substring(sp + 1).trim() == ref) line.substring(0, sp) else null
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * HEAD's commit and branch WITHOUT spawning git — the process-free equivalent of
+     * `rev-parse HEAD` + `symbolic-ref --short HEAD`. Every operation that moves HEAD
+     * rewrites `.git/HEAD` or the branch ref, so this is as current as a spawn.
+     *
+     * Returns null only when HEAD itself is unreadable (not a git dir, or a race with
+     * git rewriting it) — callers then fall back to spawning git. An unborn branch is
+     * NOT a failure: it yields a state with a null sha, as `rev-parse` failing would.
+     */
+    fun readHeadState(gitDir: String): HeadState? {
+        val raw = try {
+            File(gitDir, "HEAD").readText().trim()
+        } catch (_: Exception) {
+            return null
+        }
+        if (raw.startsWith("ref:")) {
+            val ref = raw.removePrefix("ref:").trim()
+            // `symbolic-ref --short` strips refs/heads/; for the rare non-branch
+            // symbolic HEAD keep the full ref so it stays a stable, distinct name.
+            val branch = if (ref.startsWith("refs/heads/")) ref.removePrefix("refs/heads/") else ref
+            return HeadState(resolveRef(gitDir, ref), branch.takeIf { it.isNotEmpty() })
+        }
+        return HeadState(raw.takeIf { OBJECT_ID.matches(it) }, null)
     }
 
     /**

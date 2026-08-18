@@ -44,6 +44,13 @@ class CliDataService(private val project: Project) : Disposable {
     // refresh can outlast the tick — and all contend, slowing each other.
     private val refreshing = java.util.concurrent.atomic.AtomicBoolean(false)
     @Volatile private var refreshPending = false
+    // Set by every trigger that can change the repo-wide picture (an edit landing on
+    // disk, a save, a commit, a file created/deleted). Tab NAVIGATION leaves it false:
+    // it changes which files need the cheap per-editor pass, not the working logs.
+    private val dataDirty = java.util.concurrent.atomic.AtomicBoolean(true)
+    // Last repo-wide result, reused while dataDirty is false. BlameMap.replaceAll is
+    // handed a fresh map each pass, so nothing downstream mutates this.
+    @Volatile private var repoWideCache: RepoWide? = null
 
     private fun normalizedGenType(genType: String?): String = genType?.trim()?.lowercase() ?: ""
     private fun isInlineCompletionType(genType: String?): Boolean = normalizedGenType(genType) == "completion"
@@ -89,18 +96,31 @@ class CliDataService(private val project: Project) : Disposable {
             FileEditorManagerListener.FILE_EDITOR_MANAGER,
             object : FileEditorManagerListener {
                 override fun fileOpened(source: FileEditorManager, file: VirtualFile) {
-                    scheduleRefreshOnSave()
+                    // Navigation: opening a tab changes which files need the per-file
+                    // authorship call, not the repo-wide working logs.
+                    scheduleRefreshOnSave(RefreshKind.NAVIGATION)
                 }
             }
         )
-        // Unsaved edits (an AI chat apply writes the document without saving) must
-        // refresh the gutter too. This used to be GutterV2Overlay's DocumentListener;
-        // routing it through the single CliDataService refresh keeps one authorship
-        // source (BlameDecorations paints the result) instead of a second fetcher.
+        // A document change is not itself an attribution signal under v2, and treating
+        // it as one was expensive: a refresh runs `blamely authorship --all` per repo
+        // plus one call per visible editor, so refreshing per keystroke kept those
+        // running for as long as the user typed.
+        //
+        // What the v2 gutter renders is the working log, and there is a precise signal
+        // for when that lands: WorkingLogTracker flushes 400ms after the last edit —
+        // including the unsaved writes an AI chat apply makes, which is what this
+        // listener was originally here for — and CliDataWatchService watches the
+        // `.git/blamely` subtree. Disk-state changes (`git diff HEAD`, which scopes the
+        // gutter) can only follow a save, which the VFS listener above already covers.
+        //
+        // v1 has no equivalent signal — its data lands in SQLite, which nothing watches
+        // — so there the change-driven refresh is still the only prompt path.
         com.intellij.openapi.editor.EditorFactory.getInstance().eventMulticaster.addDocumentListener(
             object : com.intellij.openapi.editor.event.DocumentListener {
                 override fun documentChanged(event: com.intellij.openapi.editor.event.DocumentEvent) {
                     if (project.isDisposed) return
+                    if (ai.blamely.settings.BlamelySettings.getInstance().attributionV2) return
                     val editors = com.intellij.openapi.editor.EditorFactory.getInstance().getEditors(event.document)
                     if (editors.any { it.project == project }) scheduleRefreshOnSave()
                 }
@@ -131,11 +151,11 @@ class CliDataService(private val project: Project) : Disposable {
     // Coalesce the burst of VFS events a single save produces into one refresh.
     // The 1500ms retry catches the case where the Blamely daemon writes the edit
     // row to SQLite after the first 300ms refresh fires (async DB write race).
-    private fun scheduleRefreshOnSave() {
+    private fun scheduleRefreshOnSave(kind: RefreshKind = RefreshKind.DATA) {
         if (project.isDisposed) return
         saveAlarm.cancelAllRequests()
-        saveAlarm.addRequest({ if (!project.isDisposed) refresh() }, 300)
-        saveAlarm.addRequest({ if (!project.isDisposed) refresh() }, 1500)
+        saveAlarm.addRequest({ if (!project.isDisposed) refresh(kind) }, 300)
+        saveAlarm.addRequest({ if (!project.isDisposed) refresh(kind) }, 1500)
     }
 
     override fun dispose() {
@@ -162,14 +182,18 @@ class CliDataService(private val project: Project) : Disposable {
         val roots = LinkedHashSet<String>()
         fun consider(path: String?) {
             val p = path ?: return
-            if (File(p, ".git").exists()) roots.add(File(p).path)
+            // discoverRepoRoots yields the repo containing p, or — when p is a
+            // directory opened ABOVE its clones — each repo nested beneath it.
+            for (root in GitUtils.discoverRepoRoots(p)) {
+                if (File(root, ".git").exists()) roots.add(File(root).path)
+            }
         }
-        consider(GitUtils.getRepoRoot(project))
+        consider(project.basePath)
         try {
             ApplicationManager.getApplication().runReadAction {
                 if (project.isDisposed) return@runReadAction
                 for (vf in com.intellij.openapi.roots.ProjectRootManager.getInstance(project).contentRoots) {
-                    consider(GitUtils.getRepoRoot(vf.path))
+                    consider(vf.path)
                 }
             }
         } catch (_: Exception) {
@@ -186,33 +210,40 @@ class CliDataService(private val project: Project) : Disposable {
         val merged = HashMap<String, List<LineBlame>>()
         if (java.io.File(bin).exists()) {
             val repoRoots = projectRepoRoots()
-            val repoStates = HashMap<String, WorkingTreeState>()
-            for (repoRoot in repoRoots) {
-                // Scope each repo's working logs to its uncommitted-vs-HEAD changes
-                // BEFORE key conversion — a log orphaned under an old branch/base (e.g.
-                // after `checkout -b` + commit on another branch) describes lines now
-                // identical to HEAD, so it must not paint. Mirrors the v1 refreshRepo
-                // safety net that refreshV2 previously lacked.
-                val state = collectWorkingTreeState(repoRoot)
-                repoStates[File(repoRoot).path] = state
-                val byFile = HashMap<String, List<LineBlame>>()
-                for (wl in fetchAllWorkingLogs(bin, repoRoot)) {
-                    val file = (wl.file ?: continue).replace('\\', '/')
-                    byFile[file] = ai.blamely.authorship.workingLogToLineBlame(wl)
-                }
-                scopeToUncommittedWorkingTree(byFile, state.changedSets, state.untrackedFiles)
-                for ((rel, entries) in byFile) {
-                    merged[GitUtils.blameKey(java.io.File(repoRoot, rel).path)] = entries
-                }
+            // The repo-wide pass is the expensive half: per repo it runs `blamely
+            // authorship --all` plus `git diff HEAD` / `ls-files`. Its inputs are the
+            // working logs and the on-disk working tree, neither of which can change by
+            // opening a tab — so on a navigation-only refresh, reuse the last result and
+            // run only the per-visible-editor calls below.
+            if (dataDirty.compareAndSet(true, false) || repoWideCache == null) {
+                repoWideCache = collectRepoWide(bin, repoRoots)
             }
+            val cache = repoWideCache!!
+            // Copy: the visible-editor pass overrides entries, and those overrides must
+            // not leak into the cached repo-wide result.
+            merged.putAll(cache.entries)
             // Visible editors: seed COMMITTED + uncommitted authorship (single-file
             // `authorship` seeds from the commit notes when there's no working log),
             // overriding --all — so a just-committed file keeps its committed history
             // in the gutter instead of showing only the current change.
-            for (path in visibleEditorPaths()) {
-                val wl = runAuthorshipSingle(bin, path) ?: continue
+            //
+            // In parallel: these are independent CLI calls, and in sequence the refresh
+            // cost (open editors × one process) end to end — with a split or a few tabs
+            // that dominated the whole refresh.
+            val futures = visibleEditorPaths().map { path ->
+                ApplicationManager.getApplication().executeOnPooledThread<Pair<String, ai.blamely.authorship.WorkingLogJson?>> {
+                    path to runAuthorshipSingle(bin, path)
+                }
+            }
+            for (future in futures) {
+                val (path, wl) = try {
+                    future.get()
+                } catch (_: Exception) {
+                    continue // one editor's authorship failing must not drop the rest
+                }
+                if (wl == null) continue
                 merged[GitUtils.blameKey(path)] =
-                    scopeVisibleEditor(path, wl, repoRoots, repoStates)
+                    scopeVisibleEditor(path, wl, repoRoots, cache.repoStates)
             }
         }
         ApplicationManager.getApplication().invokeLater {
@@ -226,6 +257,38 @@ class CliDataService(private val project: Project) : Disposable {
         val changedSets: Map<String, Set<Int>>,
         val untrackedFiles: Set<String>,
     )
+
+    /** Whether a refresh must recompute the repo-wide half or only the open editors. */
+    enum class RefreshKind { DATA, NAVIGATION }
+
+    private data class RepoWide(
+        val entries: Map<String, List<LineBlame>>,
+        val repoStates: Map<String, WorkingTreeState>,
+    )
+
+    /** Every repo's tracked working logs, scoped to that repo's uncommitted-vs-HEAD
+     *  changes BEFORE key conversion — a log orphaned under an old branch/base (e.g.
+     *  after `checkout -b` + commit on another branch) describes lines now identical to
+     *  HEAD, so it must not paint. Mirrors the v1 refreshRepo safety net that refreshV2
+     *  previously lacked. */
+    private fun collectRepoWide(bin: String, repoRoots: List<String>): RepoWide {
+        val entries = HashMap<String, List<LineBlame>>()
+        val repoStates = HashMap<String, WorkingTreeState>()
+        for (repoRoot in repoRoots) {
+            val state = collectWorkingTreeState(repoRoot)
+            repoStates[File(repoRoot).path] = state
+            val byFile = HashMap<String, List<LineBlame>>()
+            for (wl in fetchAllWorkingLogs(bin, repoRoot)) {
+                val file = (wl.file ?: continue).replace('\\', '/')
+                byFile[file] = ai.blamely.authorship.workingLogToLineBlame(wl)
+            }
+            scopeToUncommittedWorkingTree(byFile, state.changedSets, state.untrackedFiles)
+            for ((rel, blame) in byFile) {
+                entries[GitUtils.blameKey(java.io.File(repoRoot, rel).path)] = blame
+            }
+        }
+        return RepoWide(entries, repoStates)
+    }
 
     /** Resolve a repo's uncommitted-vs-HEAD state (changed lines per file + untracked
      *  files). Shared by the v1 refreshRepo scan and the v2 refreshV2 scan so both
@@ -314,8 +377,10 @@ class CliDataService(private val project: Project) : Disposable {
 
     private data class AllWorkingLogs(val files: List<ai.blamely.authorship.WorkingLogJson>? = null)
 
-    fun refresh() {
+    @JvmOverloads
+    fun refresh(kind: RefreshKind = RefreshKind.DATA) {
         if (project.isDisposed) return
+        if (kind == RefreshKind.DATA) dataDirty.set(true)
         // Attribution v2 owns the gutter/status bar/sidebar — rebuild the map
         // repo-wide from the working logs (one v2 source, I4) instead of the v1
         // SQLite scan. Fixes the previous-commit-then-vanish gutter race (no v1
@@ -333,6 +398,17 @@ class CliDataService(private val project: Project) : Disposable {
                     do {
                         refreshPending = false
                         refreshV2()
+                        // A pass runs `blamely authorship` per repo plus one per open
+                        // editor. Triggers arriving DURING a pass immediately queue the
+                        // next one, so without a floor between passes those spawns run
+                        // back to back for as long as events keep arriving.
+                        if (refreshPending && !project.isDisposed) {
+                            try {
+                                Thread.sleep(REFRESH_COOLDOWN_MS)
+                            } catch (_: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                            }
+                        }
                     } while (refreshPending && !project.isDisposed)
                 } finally {
                     refreshing.set(false)
@@ -1170,4 +1246,8 @@ class CliDataService(private val project: Project) : Disposable {
         )
     }
 
+    private companion object {
+        /** Minimum idle gap between consecutive refresh passes (see refresh()). */
+        private const val REFRESH_COOLDOWN_MS = 750L
+    }
 }

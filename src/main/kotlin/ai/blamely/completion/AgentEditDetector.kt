@@ -189,8 +189,6 @@ class AgentEditDetector(private val project: Project) : Disposable {
         // Gate: only consider writes that happened while Copilot was active.
         if (System.currentTimeMillis() - lastCopilotChatMs > COPILOT_WINDOW_MS) return
 
-        val projectRoot = GitUtils.getRepoRoot(project) ?: return
-
         // Collect candidate (absPath, isCreate) on the calling (EDT/write) thread
         // — cheap filtering only — then offload git + disk + hashing + POST.
         // Creates inside CompletionDetector's chat-apply window are skipped: the
@@ -220,21 +218,35 @@ class AgentEditDetector(private val project: Project) : Disposable {
 
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
+            // The repos this project spans. A project dir opened ABOVE its clones is
+            // in no repo itself, so a single "project root" would match no file and
+            // drop every agent edit — resolve each file's own repo instead.
+            val repos = project.getService(CliDataService::class.java)?.projectRepoRoots().orEmpty()
+            if (repos.isEmpty()) return@executeOnPooledThread
             for ((absPath, isCreate) in candidates) {
+                val root = repoForFile(repos, absPath) ?: continue
                 try {
-                    recordAgentEdit(projectRoot, absPath, isCreate)
+                    recordAgentEdit(root, absPath, isCreate)
                 } catch (_: Exception) {
                     // best-effort; never let one file abort the batch
                 }
             }
             for ((absPath, content) in deletes) {
+                val root = repoForFile(repos, absPath) ?: continue
                 try {
-                    recordDeletedFile(projectRoot, absPath, content)
+                    recordDeletedFile(root, absPath, content)
                 } catch (_: Exception) {
                     // best-effort; never let one file abort the batch
                 }
             }
         }
+    }
+
+    /** The project repo that owns [absPath], or null when the file belongs to none
+     *  (a file open from elsewhere on disk — never attributed to this project). */
+    private fun repoForFile(repos: List<String>, absPath: String): String? {
+        val fileRoot = GitUtils.getRepoRoot(absPath) ?: return null
+        return repos.firstOrNull { it == fileRoot }
     }
 
     /** VFS `before`: snapshot each file about to be DELETED while it still exists, so
