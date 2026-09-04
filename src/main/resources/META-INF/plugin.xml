@@ -2,7 +2,7 @@
 <idea-plugin>
   <id>ai.blamely</id>
   <name>Blamely</name>
-  <version>1.8.1</version>
+  <version>1.8.2</version>
   <vendor email="support@blamely.ai" url="https://blamely.ai">Blamely</vendor>
 
   <description><![CDATA[
@@ -98,6 +98,13 @@ blamely doctor    # full self-check
   ]]></description>
 
   <change-notes><![CDATA[
+    <h3>1.8.2</h3>
+    <ul>
+      <li><b>Pasting no longer freezes the IDE</b> — every paste of more than a few characters made Blamely run several <code>git</code> commands before the editor was allowed to respond, and a multi-cursor paste, or the automatic reformat that follows one, multiplied that by every insertion point. Blamely now gets the same information without running anything at all, and does the rest out of your way. Typing is lighter too: the plugin was copying the whole file three times on every keystroke, even when nothing needed those copies.</li>
+      <li><b>Branching before you commit no longer credits the AI's work to you</b> — working on your main branch and creating a branch when it is time to commit (<code>git checkout -b my-feature</code>) quietly lost the entire session's AI attribution, and the commit reported every AI-written line as hand-written. It is now carried across the branch you made, and the gutter is right straight away rather than only after the commit.</li>
+      <li><b>Attribution reaches your remote again after the first clash</b> — once a teammate's breakdown had arrived at the remote before yours, or your own rebase had rewritten yours, every send after that was refused in silence and your records stayed on your machine. Both sides are now brought together and sent.</li>
+      <li><b>Blamely now tells you when a project switches it off</b> — a project that manages its own git hooks (Husky, lefthook, pre-commit) takes over the setting Blamely depends on, and Blamely then records nothing at all there. <code>blamely doctor</code> now reports it and tells you what to do.</li>
+    </ul>
     <h3>1.8.1</h3>
     <ul>
       <li><b>Attribution written on a detached HEAD is no longer lost</b> — while you were on a detached HEAD (during a rebase, or after checking out a commit directly), the IDE saved your in-progress attribution to a different folder than the one Blamely reads at commit time, so that work was credited to nobody. Both now agree.</li>
