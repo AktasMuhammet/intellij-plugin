@@ -389,8 +389,16 @@ class CompletionDetector(private val project: Project) : Disposable {
         // both the v2 tracker hook below and — for a chat apply — the daemon's
         // /snapshot baseline (so a wide apply can be narrowed to the truly-new
         // lines, mirroring VS Code's post-send putSnapshot).
-        val prevFull: String? = try {
-            val newFull = event.document.text
+        //
+        // Building it costs THREE full-document string copies (document.text, the
+        // substring pair, the concat). This runs on the EDT inside the write action
+        // for every single document change, so with v2 off — where nothing reads it
+        // — it was pure per-keystroke garbage proportional to file size. Skip it
+        // unless a consumer exists.
+        val wantsPrevFull = chatApply ||
+            (onEditObserved != null && ai.blamely.settings.BlamelySettings.getInstance().attributionV2)
+        val newFull: String = if (wantsPrevFull) event.document.text else ""
+        val prevFull: String? = if (!wantsPrevFull) null else try {
             val off = event.offset
             val nfLen = event.newFragment.length
             if (off in 0..newFull.length && off + nfLen <= newFull.length) {
@@ -432,7 +440,10 @@ class CompletionDetector(private val project: Project) : Disposable {
                             inlineAccept -> ai.blamely.authorship.Author(ai.blamely.authorship.AuthorType.AI, tool = resolveTool(signalTool), genType = "completion")
                             else -> ai.blamely.authorship.Author(ai.blamely.authorship.AuthorType.HUMAN, genType = "human")
                         }
-                        hook(vf.path, prevFull, event.document.text, author)
+                        // newFull, not a second document.text: prevFull was built from
+                        // exactly this snapshot, so recomputing it here both duplicates
+                        // a full-file copy and risks pairing mismatched revisions.
+                        hook(vf.path, prevFull, newFull, author)
                     }
                 } catch (_: Exception) {
                 }
@@ -523,7 +534,7 @@ class CompletionDetector(private val project: Project) : Disposable {
                 suggestedLines = (band.second - band.first + 1).toLong(),
                 lines = lineRanges,
                 rawMeta = rawMeta,
-                branch = GitUtils.getBranchName(repoRoot),
+                branch = GitUtils.getBranchNameFast(repoRoot),
             )
             if (debugEnabled()) {
                 BlamelyLogger.info("record: tool=$tool gen_type=$genType $relPath L${band.first}-${band.second}")
@@ -637,36 +648,44 @@ class CompletionDetector(private val project: Project) : Disposable {
         val vFile = FileDocumentManager.getInstance().getFile(doc) ?: return
         if (!vFile.isInLocalFileSystem) return
         val absPath = vFile.path
-        val repoRoot = GitUtils.getRepoRoot(absPath) ?: return
 
-        // Pause during cherry-pick/merge/revert/rebase: edits applied by replaying
-        // history aren't fresh authorship. content_sha re-attributes them after.
-        if (GitUtils.inProgressGitOp(repoRoot)) return
-
-        // Only handle files under THIS project's content roots — otherwise every
-        // open project's detector records the same paste (duplicate daemon rows).
-        val inProject = try {
-            ApplicationManager.getApplication().runReadAction<Boolean> {
-                !project.isDisposed &&
-                    com.intellij.openapi.roots.ProjectFileIndex.getInstance(project).isInContent(vFile)
-            }
-        } catch (_: Exception) {
-            false
-        }
-        if (!inProject) return
-
-        val relPath = GitUtils.toRepoRelativePath(repoRoot, absPath) ?: return
-
-        // Compute the changed band + per-line content_sha on the EDT (document
-        // access is valid here; the post-change document already holds the pasted
-        // lines). See buildLineRangesWithSha for why the hashes matter.
+        // ONLY document work runs on the EDT from here: this method is on the
+        // hot path of every paste-sized insert, and the listener fires inside a
+        // write action. Repo-root resolution, the git-op check, the branch read
+        // and the clipboard read all used to run here — up to three git
+        // processes per paste, multiplied by every caret in a multi-caret paste
+        // and by the reformat-on-paste events that follow. That is what locked
+        // the IDE up. They now run on the pooled thread below; the band and the
+        // per-line hashes still have to be taken here, while the post-change
+        // document is guaranteed current.
         val band = narrowedBand(doc, event.offset, event.oldFragment.toString(), newFragment)
         val lineRanges = buildLineRangesWithSha(doc, band.first, band.second)
-        val repoId = CliRepoId.get(repoRoot) ?: repoRoot
-        val branch = GitUtils.getBranchName(repoRoot)
 
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
+            val repoRoot = GitUtils.getRepoRoot(absPath) ?: return@executeOnPooledThread
+
+            // Pause during cherry-pick/merge/revert/rebase: edits applied by replaying
+            // history aren't fresh authorship. content_sha re-attributes them after.
+            if (GitUtils.inProgressGitOp(repoRoot)) return@executeOnPooledThread
+
+            // Only handle files under THIS project's content roots — otherwise every
+            // open project's detector records the same paste (duplicate daemon rows).
+            val inProject = try {
+                ApplicationManager.getApplication().runReadAction<Boolean> {
+                    !project.isDisposed &&
+                        com.intellij.openapi.roots.ProjectFileIndex.getInstance(project).isInContent(vFile)
+                }
+            } catch (_: Exception) {
+                false
+            }
+            if (!inProject) return@executeOnPooledThread
+
+            val relPath = GitUtils.toRepoRelativePath(repoRoot, absPath)
+                ?: return@executeOnPooledThread
+            val repoId = CliRepoId.get(repoRoot) ?: repoRoot
+            val branch = GitUtils.getBranchNameFast(repoRoot)
+
             refreshClipboardCache()
             if (!isLikelyPaste(newFragment)) return@executeOnPooledThread
 
@@ -712,30 +731,34 @@ class CompletionDetector(private val project: Project) : Disposable {
         val vFile = FileDocumentManager.getInstance().getFile(doc) ?: return
         if (!vFile.isInLocalFileSystem) return
         val absPath = vFile.path
-        val repoRoot = GitUtils.getRepoRoot(absPath) ?: return
 
-        // Replayed content (cherry-pick/merge/revert/rebase) is not fresh authorship.
-        if (GitUtils.inProgressGitOp(repoRoot)) return
-
-        // Only files under THIS project's content roots (same guard as handle()).
-        val inProject = try {
-            ApplicationManager.getApplication().runReadAction<Boolean> {
-                !project.isDisposed &&
-                    com.intellij.openapi.roots.ProjectFileIndex.getInstance(project).isInContent(vFile)
-            }
-        } catch (_: Exception) {
-            false
-        }
-        if (!inProject) return
-        if (GitUtils.toRepoRelativePath(repoRoot, absPath) == null) return
-
-        // Band on the EDT (document access is valid here); clipboard check on a
-        // pooled thread, same split as maybeRecordPaste.
+        // Band on the EDT (document access is valid here); every git touch, the
+        // repo-membership check and the clipboard read run on the pooled thread —
+        // same split as maybeRecordPaste, and for the same reason: a multi-line
+        // replace fires this on the paste path too, so anything blocking here is
+        // paid twice per paste.
         val band = narrowedBand(doc, event.offset, event.oldFragment.toString(), newFragment)
         val pathKey = GitUtils.blameKey(absPath)
 
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
+            val repoRoot = GitUtils.getRepoRoot(absPath) ?: return@executeOnPooledThread
+
+            // Replayed content (cherry-pick/merge/revert/rebase) is not fresh authorship.
+            if (GitUtils.inProgressGitOp(repoRoot)) return@executeOnPooledThread
+
+            // Only files under THIS project's content roots (same guard as handle()).
+            val inProject = try {
+                ApplicationManager.getApplication().runReadAction<Boolean> {
+                    !project.isDisposed &&
+                        com.intellij.openapi.roots.ProjectFileIndex.getInstance(project).isInContent(vFile)
+                }
+            } catch (_: Exception) {
+                false
+            }
+            if (!inProject) return@executeOnPooledThread
+            if (GitUtils.toRepoRelativePath(repoRoot, absPath) == null) return@executeOnPooledThread
+
             refreshClipboardCache()
             if (isLikelyPaste(newFragment)) return@executeOnPooledThread
             val blameService = project.getService(BlameMapService::class.java)

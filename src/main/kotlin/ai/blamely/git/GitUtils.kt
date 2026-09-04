@@ -22,14 +22,32 @@ object GitUtils {
         return run(cwd, *args)
     }
 
-    fun run(cwd: String, vararg args: String): String? {
-        for (gitExe in GIT_CANDIDATES) {
-            if (gitExe != "git" && !File(gitExe).canExecute()) continue
-            val out = runWithGit(cwd, gitExe, *args)
-            if (out != null) return out
-        }
-        return null
+    // The git executable, resolved ONCE per IDE session.
+    //
+    // This used to retry every candidate on each call, because Proc.run returns
+    // null both when git is missing AND when git ran fine but said nothing
+    // (`symbolic-ref` on a detached HEAD, an empty `diff --shortstat`). A command
+    // that legitimately produces no output therefore spawned FOUR processes — on
+    // the EDT, on the paste path. Probing once and remembering the winner keeps a
+    // silent-but-successful git to a single spawn.
+    @Volatile private var resolvedGitExe: String? = null
+
+    private fun gitExe(): String {
+        resolvedGitExe?.let { return it }
+        val exe = GIT_CANDIDATES.firstOrNull { cand ->
+            if (cand == "git") {
+                ai.blamely.utils.Proc.run(
+                    listOf(cand, "--version"), dir = null, timeoutMs = 5_000, maxBytes = 4096,
+                ) != null
+            } else {
+                File(cand).canExecute()
+            }
+        } ?: "git"
+        resolvedGitExe = exe
+        return exe
     }
+
+    fun run(cwd: String, vararg args: String): String? = runWithGit(cwd, gitExe(), *args)
 
     private fun runWithGit(cwd: String, gitExe: String, vararg args: String): String? {
         // Proc.run bounds the child (git runs on the 3s poll loop — a hung git
@@ -359,12 +377,44 @@ object GitUtils {
      * during these are replays of existing content, not fresh authorship, so the
      * detectors pause recording while one is in progress.
      */
+    private val GIT_OP_MARKERS =
+        listOf("CHERRY_PICK_HEAD", "MERGE_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
+
     fun inProgressGitOp(cwd: String): Boolean {
-        val gitDir = run(cwd, "rev-parse", "--absolute-git-dir")?.trim()?.takeIf { it.isNotEmpty() }
-            ?: return false
+        // gitDir() is memoized per repo, so this is five stat() calls — NOT the
+        // `git rev-parse --absolute-git-dir` spawn it used to be. It is called from
+        // the document listener (i.e. the EDT, inside a write action) on every
+        // paste-sized edit; a process launch there is what froze the IDE.
+        val gitDir = gitDir(cwd) ?: return false
         val dir = java.io.File(gitDir)
-        return listOf("CHERRY_PICK_HEAD", "MERGE_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
-            .any { java.io.File(dir, it).exists() }
+        return GIT_OP_MARKERS.any { java.io.File(dir, it).exists() }
+    }
+
+    /**
+     * Branch name WITHOUT spawning git when possible — the process-free twin of
+     * [getBranchName], reading .git/HEAD the same way [readHeadState] does. Returns
+     * null on a detached HEAD, matching [getBranchName]'s contract.
+     */
+    fun getBranchNameFast(cwd: String): String? {
+        val gitDir = gitDir(cwd)
+        if (gitDir != null) {
+            readHeadState(gitDir)?.let { return it.branch }
+        }
+        return getBranchName(cwd)
+    }
+
+    /**
+     * Repo root for [path] ONLY if it is already memoized; never spawns git.
+     *
+     * The EDT paths (document listener) use this so a first-touch of a file cannot
+     * fork a process inside a write action. A miss schedules the real lookup on a
+     * pooled thread, so the very next edit in that file hits the cache.
+     */
+    fun getRepoRootCached(path: String): String? {
+        if (path.isBlank()) return null
+        repoRootCache[path]?.let { return it }
+        ApplicationManager.getApplication().executeOnPooledThread { getRepoRoot(path) }
+        return null
     }
 
     fun getNoteContent(cwd: String, sha: String): String? =
