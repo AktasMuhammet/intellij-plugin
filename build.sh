@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-# Default: fast plugin ZIP (no ProGuard). For production / GitHub Releases use ./release-build.sh
+# Default: fast plugin ZIP. For production / GitHub Releases use ./release-build.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
